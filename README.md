@@ -8,7 +8,7 @@ A domain-specific chatbot trained on Pakistan tourism PDFs and CSV data. This AI
 
 ## ✨ Live Demo
 
-**Try it here:** [https://huggingface.co/spaces/your-username/pakistan-tourism-chatbot](https://huggingface.co/spaces/your-username/pakistan-tourism-chatbot)
+**Try it here:** [https://huggingface.co/spaces/your-username/pakistan-tourism-chatbot](https://huggingface.co/spaces/Danyal3269/tourism_chatbot)
 
 ## 📋 Features
 
