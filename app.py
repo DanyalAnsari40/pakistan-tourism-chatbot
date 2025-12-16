@@ -1,264 +1,236 @@
-# app.py - Optimized for GitHub + Hugging Face Deployment
-
-import os
+# ===================== IMPORTS =====================
 import gradio as gr
-import sys
-import logging
+import faiss
+import pickle
+import numpy as np
+import re
+from sentence_transformers import SentenceTransformer
+import requests
+import os
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# ===================== CONFIG =====================
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")  # Set in Hugging Face Secrets
+GROQ_MODEL = "llama-3.1-8b-instant"
 
-class PakistanTourismBot:
-    def __init__(self):
-        self.model_loaded = False
-        self.vector_db = None
-        self._initialize_model()
-    
-    def _initialize_model(self):
-        """Lazy loading of model to save memory"""
-        try:
-            # Try to load the vector database
-            if os.path.exists("trained_model"):
-                from langchain_huggingface import HuggingFaceEmbeddings
-                from langchain_community.vectorstores import FAISS
-                
-                logger.info("Loading embeddings...")
-                embeddings = HuggingFaceEmbeddings(
-                    model_name="sentence-transformers/all-MiniLM-L6-v2"
-                )
-                
-                logger.info("Loading FAISS vector store...")
-                self.vector_db = FAISS.load_local(
-                    "trained_model",
-                    embeddings,
-                    allow_dangerous_deserialization=True
-                )
-                self.model_loaded = True
-                logger.info("✅ Model loaded successfully")
-            else:
-                logger.warning("⚠️ No trained model found. Using fallback responses.")
-                
-        except Exception as e:
-            logger.error(f"❌ Error loading model: {e}")
-            self.model_loaded = False
-    
-    def ask(self, question):
-        """Main query function"""
-        question = question.strip().lower()
+# ===================== LOAD EMBEDDER =====================
+embedder = SentenceTransformer("all-MiniLM-L6-v2")
+index = None
+chunks = []
+
+# ===================== LOAD TRAINED DATA =====================
+def load_trained_model():
+    global index, chunks
+    if not os.path.exists("trained_index.faiss") or not os.path.exists("chunks.pkl"):
+        print("❌ Trained files missing")
+        return False
+
+    index = faiss.read_index("trained_index.faiss")
+    with open("chunks.pkl", "rb") as f:
+        chunks = pickle.load(f)
+
+    print(f"✅ Loaded | Chunks: {len(chunks)}")
+    return True
+
+load_trained_model()
+
+# ===================== TEXT QUALITY FILTER =====================
+def is_valid_text(text):
+    text = text.strip()
+    if len(text.split()) < 15:
+        return False
+    if sum(c.isdigit() for c in text) / max(len(text), 1) > 0.30:
+        return False
+    if not re.search(r"[a-zA-Z]{3,}", text):
+        return False
+    return True
+
+# ===================== ENHANCED TOURISM GUIDE GROQ =====================
+def tourism_guide_groq(question, retrieved_chunks):
+    """
+    Enhanced for tourism guidance: Always give practical, helpful advice
+    based on available information. If exact info isn't available, give
+    general tourism guidance based on context.
+    """
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    # Prepare context from chunks
+    context = "\n---\n".join([chunk for chunk in retrieved_chunks[:3]])
+
+    prompt = f"""SYSTEM: You are a helpful Pakistan Tourism Guide. Your goal is to assist tourists with practical information.
+CONTEXT FROM TOURISM DATABASE:
+{context}
+USER QUESTION: {question}
+GUIDELINES FOR YOUR RESPONSE:
+1. **Always give helpful tourism advice** - never say "cannot answer"
+2. If exact information isn't in context, give **general tourism guidance** based on what you know about the location
+3. Focus on **practical information** tourists would need
+4. Be **positive and encouraging** about tourism in Pakistan
+5. Format your answer as a **helpful guide**, not just facts
+6. For costs/questions not in context, provide **reasonable estimates** based on similar locations in Pakistan
+7. Structure your answer with clear sections
+IMPORTANT: If specific costs aren't mentioned, provide ESTIMATED RANGES based on:
+- Budget: 1,000 - 3,000 PKR per night
+- Mid-range: 3,000 - 8,000 PKR per night  
+- Luxury: 8,000+ PKR per night
+EXAMPLE RESPONSE FORMAT:
+**🏨 Accommodation in [City]:**
+• Budget options: 1,000-3,000 PKR (guesthouses, hostels)
+• Mid-range hotels: 3,000-8,000 PKR
+• Luxury stays: 8,000+ PKR
+**💡 Practical Tips:**
+[Provide helpful tips based on context]
+**🎯 Best Time to Visit:**
+[If mentioned in context, otherwise general advice]
+Now provide a helpful tourism guide response to the question below:
+ANSWER:"""
+
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": "You are a helpful, knowledgeable Pakistan Tourism Guide. Always provide practical tourism advice."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.3,  # Slightly higher for creative but factual responses
+        "max_tokens": 600,
+        "top_p": 0.9
+    }
+
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=30)
+        r.raise_for_status()
+        response_data = r.json()
         
-        # Greetings
-        if any(word in question for word in ['hi', 'hello', 'hey']):
-            return self._greeting_response()
-        
-        # Help
-        if 'help' in question:
-            return self._help_response()
-        
-        # If model is loaded, use it
-        if self.model_loaded and self.vector_db:
-            try:
-                docs = self.vector_db.similarity_search(question, k=3)
-                if docs:
-                    return self._format_from_docs(question, docs)
-            except Exception as e:
-                logger.error(f"Search error: {e}")
-        
-        # Fallback responses
-        return self._fallback_response(question)
-    
-    def _greeting_response(self):
-        return """🇵🇰 **Welcome to Pakistan Tourism Chatbot!**
-
-I can help you with:
-• Tourist destinations in Pakistan
-• Best times to visit
-• Attractions and sightseeing
-• Travel tips and information
-• Local culture and food
-
-What would you like to know?"""
-    
-    def _help_response(self):
-        return """**Sample Questions:**
-
-🏔️ **Destinations:**
-- Best places to visit in Pakistan?
-- Top tourist spots in Lahore?
-- Must-see places in Northern Areas?
-
-📅 **Timing:**
-- When to visit Hunza Valley?
-- Best season for Murree?
-- Weather in Islamabad?
-
-🏞️ **Attractions:**
-- What to see in Karachi?
-- Historical sites in Pakistan?
-- Adventure activities?
-
-🍽️ **Food & Culture:**
-- Local food to try?
-- Cultural experiences?
-- Shopping recommendations?
-
-🚗 **Travel:**
-- How to reach Skardu?
-- Accommodation options?
-- Travel tips for Pakistan?"""
-    
-    def _format_from_docs(self, question, docs):
-        """Format response from documents"""
-        context = "\n".join([doc.page_content[:500] for doc in docs])
-        
-        # Simple formatting based on question type
-        if any(word in question for word in ['best place', 'where to go', 'recommend']):
-            return f"**Top Recommendations:**\n\n{context[:800]}..."
-        
-        elif any(word in question for word in ['best time', 'when to visit', 'season']):
-            return f"**Best Time Information:**\n\n{context[:600]}..."
-        
-        elif any(word in question for word in ['attraction', 'what to see', 'things to do']):
-            return f"**Attractions:**\n\n{context[:700]}..."
-        
+        if "choices" in response_data and len(response_data["choices"]) > 0:
+            answer = response_data["choices"][0]["message"]["content"]
+            # Clean up any confidence mentions
+            answer = answer.replace("Confidence level:", "").replace("confidence level:", "")
+            return answer
         else:
-            return f"**Information:**\n\n{context[:500]}..."
+            return "I'm here to help with your tourism questions! Could you rephrase your question?"
+    except Exception as e:
+        return f"⚠️ Connection issue. Please try again."
+
+# ===================== ENHANCED CHAT FUNCTION =====================
+def tourism_chatbot(user_msg, history):
+    """
+    Tourism-focused chatbot that always provides helpful guidance
+    """
+    # Initialize history as list if None
+    if history is None:
+        history = []
     
-    def _fallback_response(self, question):
-        """Fallback responses when model not available"""
-        responses = {
-            'lahore': """**Lahore - Cultural Heart:**
-• Badshahi Mosque (Mughal architecture)
-• Lahore Fort (UNESCO World Heritage)
-• Food Street (Local cuisine)
-• Shalimar Gardens (Mughal gardens)
-• Best Time: October to March""",
-            
-            'islamabad': """**Islamabad - Capital City:**
-• Faisal Mosque (Modern Islamic design)
-• Daman-e-Koh (Margalla Hills view)
-• Lok Virsa Museum (Cultural heritage)
-• Best Time: March to October""",
-            
-            'hunza': """**Hunza Valley - Mountain Paradise:**
-• Attabad Lake (Turquoise mountain lake)
-• Altit Fort (Ancient fortification)
-• Passu Cones (Unique peaks)
-• Best Time: May to October""",
-            
-            'karachi': """**Karachi - Coastal Metropolis:**
-• Clifton Beach (Popular seaside)
-• Quaid's Mausoleum (Founder's tomb)
-• Dolmen Mall (Shopping)
-• Best Time: November to February""",
-            
-            'murree': """**Murree - Hill Station:**
-• Mall Road (Shopping and dining)
-• Pindi Point (Scenic view)
-• Kashmir Point (Panoramic view)
-• Best Time: May to September"""
+    if index is None:
+        history.append({"role": "assistant", "content": "❌ Tourism database not loaded"})
+        return history
+
+    # Vector search (top 3 for focused responses)
+    q_vec = embedder.encode([user_msg])
+    D, I = index.search(np.array(q_vec), 3)
+
+    # Filter and collect valid chunks
+    valid_chunks = []
+    
+    for idx in I[0]:
+        if idx < len(chunks):  # Safety check
+            candidate = chunks[idx].replace("\n", " ").strip()
+            if is_valid_text(candidate):
+                valid_chunks.append(candidate)
+
+    # Always respond - even if no chunks found
+    if not valid_chunks:
+        # Generic tourism guidance for out-of-domain questions
+        generic_prompt = f"""USER QUESTION: {user_msg}
+You are a Pakistan Tourism Guide. Even though this specific question isn't in your database,
+provide helpful tourism guidance. Focus on general Pakistan travel advice, tips, and encouragement.
+Provide a helpful response about tourism in Pakistan:"""
+
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
         }
         
-        for key, response in responses.items():
-            if key in question:
-                return response
+        payload = {
+            "model": GROQ_MODEL,
+            "messages": [
+                {"role": "system", "content": "You are a helpful Pakistan Tourism Guide."},
+                {"role": "user", "content": generic_prompt}
+            ],
+            "temperature": 0.3,
+            "max_tokens": 400
+        }
         
-        return """I can provide information about Pakistan tourism. Try asking about:
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=30)
+            response_data = r.json()
+            if "choices" in response_data:
+                final_answer = response_data["choices"][0]["message"]["content"]
+            else:
+                final_answer = "I'm here to help with your Pakistan tourism questions! What would you like to know?"
+        except:
+            final_answer = "Welcome to Pakistan Tourism Guide! I can help you with information about visiting Pakistan."
+    else:
+        # Use enhanced tourism guide with retrieved chunks
+        final_answer = tourism_guide_groq(user_msg, valid_chunks)
 
-• Specific cities (Lahore, Islamabad, Karachi, Hunza)
-• Tourist attractions
-• Best times to visit
-• Travel information
-• Local food and culture
+    # Format response without confidence indicators
+    response = f"""**🇵🇰 Pakistan Tourism Guide**
+{final_answer}
+*Information based on tourism database*"""
 
-Example: "Best places in Lahore?" or "When to visit Hunza?""""
-
-# Create chatbot instance
-chatbot = PakistanTourismBot()
-
-# Gradio Interface
-def create_interface():
-    with gr.Blocks(
-        title="Pakistan Tourism Chatbot",
-        theme=gr.themes.Soft(),
-        css="""
-        .gradio-container {max-width: 800px; margin: auto;}
-        footer {visibility: hidden;}
-        """
-    ) as demo:
-        
-        gr.Markdown("""
-        # 🏔️ Pakistan Tourism Chatbot
-        ### Domain-specific AI assistant trained on Pakistan tourism data
-        
-        🇵🇰 Ask me about tourist destinations, attractions, travel tips, and cultural information!
-        """)
-        
-        with gr.Row():
-            with gr.Column(scale=2):
-                chatbot_interface = gr.Chatbot(height=400, label="Chat")
-                msg = gr.Textbox(
-                    placeholder="Ask about Pakistan tourism...",
-                    label="Your Question"
-                )
-                
-                with gr.Row():
-                    submit_btn = gr.Button("Ask", variant="primary")
-                    clear_btn = gr.Button("Clear")
-            
-            with gr.Column(scale=1):
-                gr.Markdown("### 💡 Quick Questions")
-                
-                questions = [
-                    "Best places in Pakistan?",
-                    "When to visit Northern Areas?",
-                    "Attractions in Lahore",
-                    "Local food to try",
-                    "Hill stations",
-                    "Historical sites",
-                    "Travel costs",
-                    "How to reach Skardu?"
-                ]
-                
-                for q in questions:
-                    gr.Button(q, size="sm").click(
-                        lambda q=q: q,
-                        outputs=[msg]
-                    ).then(
-                        lambda q, history: (q, history + [[q, None]]),
-                        inputs=[msg, chatbot_interface],
-                        outputs=[msg, chatbot_interface]
-                    ).then(
-                        lambda q: chatbot.ask(q),
-                        inputs=[msg],
-                        outputs=[chatbot_interface]
-                    )
-                
-                gr.Markdown("---")
-                gr.Markdown("### 📊 System Status")
-                status = "✅ Model Loaded" if chatbot.model_loaded else "⚠️ Using Fallback Mode"
-                gr.Markdown(f"**Status:** {status}")
-        
-        # Event handlers
-        def respond(message, history):
-            response = chatbot.ask(message)
-            history.append((message, response))
-            return "", history
-        
-        msg.submit(respond, [msg, chatbot_interface], [msg, chatbot_interface])
-        submit_btn.click(respond, [msg, chatbot_interface], [msg, chatbot_interface])
-        clear_btn.click(lambda: None, None, chatbot_interface)
-        
-        gr.Markdown("---")
-        gr.Markdown("*Trained on Pakistan tourism PDFs and CSV data. For latest information, check official sources.*")
+    history.append({"role": "user", "content": user_msg})
+    history.append({"role": "assistant", "content": response})
     
-    return demo
+    return history
 
-# Launch application
-if __name__ == "__main__":
-    demo = create_interface()
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=7860,
-        share=False
+# ===================== CLEAR CHAT =====================
+def clear_chat():
+    return []
+
+# ===================== GRADIO UI (SIMPLIFIED) =====================
+with gr.Blocks(theme=gr.themes.Soft(), title="Pakistan Tourism Guide") as demo:
+    gr.Markdown("""
+    # 🇵🇰 **Pakistan Tourism Guide**
+    ### Your Personal Travel Assistant for Pakistan
+    """)
+    
+    chatbot_ui = gr.Chatbot(
+        height=500, 
+        label="Tourism Assistant",
+        avatar_images=(None, "https://cdn-icons-png.flaticon.com/512/197/197561.png")
     )
+    
+    with gr.Row():
+        user_input = gr.Textbox(
+            label="Your Tourism Question", 
+            lines=2,
+            placeholder="e.g., 'Best places to visit in Islamabad?' or 'Cost to stay in Multan?'",
+            scale=4
+        )
+        submit_btn = gr.Button("Ask Guide 🚀", variant="primary")
+        clear_btn = gr.Button("Clear Chat 🧹", variant="secondary")
+    
+    with gr.Row():
+        examples = gr.Examples(
+            examples=[
+                ["Best shopping malls in Islamabad?"],
+                ["Estimated hotel costs in Lahore?"],
+                ["Top tourist attractions in Karachi?"],
+                ["Best time to visit northern areas?"]
+            ],
+            inputs=user_input,
+            label="Example Questions"
+        )
+
+    # Connect buttons
+    submit_btn.click(tourism_chatbot, [user_input, chatbot_ui], [chatbot_ui])
+    user_input.submit(tourism_chatbot, [user_input, chatbot_ui], [chatbot_ui])
+    clear_btn.click(clear_chat, outputs=[chatbot_ui])
+
+# ===================== LAUNCH =====================
+if __name__ == "__main__":
+    demo.launch()
